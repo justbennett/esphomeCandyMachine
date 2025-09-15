@@ -1,0 +1,508 @@
+
+esphome:
+  name: nodemcu-beta
+  friendly_name: "Candy Machine"
+  on_boot:
+    - priority: 700
+      then:
+        - output.turn_on: led_red    
+
+    - priority: 200
+      then:
+        - rtttl.play: "WilliamT:d=4,o=5,b=140:16c,16c,16c,16p,16c,16c,16c,16p,16c,16c,16f,16p,8g,16a,16p,16c,16c,16c,16p,16c,16c,16f,16p,16a,16a,16g,16p,8e,16c,16p,16c,16c,16c,16p,16c,16c,16c,16p,16c,16c,16f,16p,8g,16a,16p,16f,16a,c6,16p,16a#,16a,16g,16f,16p,16a,16p,16f,16p"
+        - wait_until:
+            condition:
+              wifi.connected
+        - delay: 1s
+        - script.execute:
+            id: blink_leds
+            num_blinks: 5
+        - delay: 1s
+        - wait_until: 
+            timeout: 10s
+            condition:
+              not:
+                rtttl.is_playing:       
+        - display.page.show: eyes_page
+        - servo.write: 
+            id: servo1
+            level: -75%
+        - script.execute: start_lock_timer
+
+esp8266:
+  board: nodemcuv2
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_key
+  actions:
+#Play a sound
+    - action: rtttl_play
+      variables:
+        song_str: string
+      then:
+        - display.page.show: candy_page
+        - script.execute:
+            id: blink_leds
+            num_blinks: 10
+        - rtttl.play: !lambda 'return song_str;'
+        - wait_until:
+            timeout: 10s
+            condition:
+              not:
+                - rtttl.is_playing 
+        - display.page.show: eyes_page
+
+#someone triggers the candy dispenser 
+    - action: dispense_candy
+      variables:
+        from_str: string
+      then:
+        - lambda: |-
+            id(from_global) = from_str;
+        - logger.log:
+            format: "Candy command recieved from %s"    
+            args: [ 'id(from_global)']  
+        - script.execute: dispense_candy
+
+#When we get a new display message, update the message        
+    - action: get_message
+      variables:
+        mess_str: string
+        from_str: string
+      then:
+        - script.execute:  
+            id: send_message
+            message: !lambda 'return mess_str.substr(0,32);'
+            sender: !lambda 'return from_str.substr(0,16);'         
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+globals:
+  - id: dispense_count
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  
+  - id: servo_pos
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: servo_target
+    type: int
+    restore_value: no
+    initial_value: '-100'
+
+  - id: wifi_connected
+    type: bool
+    initial_value: 'false'
+  
+  - id: display_message
+    type: std::string
+    restore_value: no
+    initial_value: '"Welcome!"'
+  
+  - id: from_global
+    type: std::string
+    restore_value: yes
+    initial_value: '"Candy Machine"'
+  
+  - id: locked
+    type: bool
+    initial_value: 'false'
+
+  - id: unlock_time
+    type: unsigned long
+    restore_value: no
+    initial_value: '1'
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: True
+  on_connect: 
+    then:
+      - lambda: |-
+          id(wifi_connected) = true;
+          id(oled).update();
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Nodemcu-Beta Fallback Hotspot"
+    password: !secret fallback_password
+
+captive_portal:
+
+i2c:
+  sda: D2
+  scl: D1
+  scan: true
+  frequency: 400kHz
+
+output:
+  - platform: esp8266_pwm
+    id: servo_output
+    pin: D5
+    frequency: 50 Hz
+
+  - platform: esp8266_pwm
+    id: buzzer_pwm
+    pin: D6
+    frequency: 2000 Hz
+
+  - platform: gpio
+    id: led_green
+    pin: D7
+
+  - platform: gpio
+    id: led_red
+    pin: D8
+  
+rtttl:
+  output: buzzer_pwm
+  id: buzzer_rtttl
+  gain: 50%
+
+servo:
+  - id: servo1
+    output: servo_output
+
+binary_sensor:
+  - platform: gpio
+    name: "Candy Button"
+    id: candy_button
+    pin:
+      number: D3
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      then:
+        - script.execute: dispense_candy
+
+lock:
+  - platform: template
+    name: "Candy Machine Lock"
+    id: candy_lock
+    lambda: |-
+      return id(locked) ? LOCK_STATE_LOCKED : LOCK_STATE_UNLOCKED;
+    # These make it report-only (HA can't change it)
+    optimistic: True
+    # Don’t define lock/unlock actions, so HA cannot call them
+
+sensor:
+  - platform: template
+    name: "Candy Lock Minutes Left"
+    id: candy_minutes_left
+    unit_of_measurement: "min"
+    update_interval: 60s
+    lambda: |-
+      unsigned long now = millis();
+      if (!id(locked)) {
+        // if not locked, ensure unlock_time cleared and return 0
+        id(unlock_time) = 0;
+        return 0.0f;
+      }
+      unsigned long ut = id(unlock_time);
+      if (ut == 0 || ut <= now) {
+        // time's up: unlock and clear timer
+        id(locked) = false;
+        id(unlock_time) = 0;
+        return 0.0f;
+      }
+      unsigned long remaining_ms = (ut > now) ? (ut - now) : 0;
+      // integer minutes remaining (floor). change math if you prefer rounding/ceil.
+      float minutes = (float)((remaining_ms + 59999UL) / 60000UL);
+      return minutes;
+    icon: "mdi:timer"
+
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SSD1306_128X64"
+    address: 0x3C
+    update_interval: 400ms
+    pages:
+      - id: status_page
+        lambda: |-
+          if (id(wifi_connected)) {
+            it.printf(0, 0, id(roboto), id(from_global).c_str());
+
+            // Split display_message into lines of max 16 characters
+            std::string msg = id(display_message);
+            int line_height = 16;  // or font size + spacing
+            int y = 16;
+
+            for (size_t i = 0; i < msg.size(); i += 16) {
+              std::string line = msg.substr(i, 16);
+              it.printf(0, y, id(roboto), line.c_str());
+              y += line_height;
+            }
+
+          } else {
+            it.printf(0, 0, id(roboto), "Connecting...");
+          }
+
+      - id: eyes_page
+        lambda: |-
+          // Track global animation timing
+          static unsigned long last_time = millis();
+          static unsigned long elapsed = 0;
+
+          // Blink timing
+          static unsigned long next_blink_at = millis() + random(5000, 9000); // 5–9s between blinks
+          static unsigned long blink_progress = 0;
+
+          // Called each lambda call
+          unsigned long now = millis();
+          unsigned long dt = now - last_time;   // time since last call (ms)
+          last_time = now;
+          elapsed += dt;   // total running time
+
+          //-----------------------------------
+          // Eyebrow Y position: 2-second cycle
+          //-----------------------------------
+          float eyebrow_phase = fmod(elapsed / 3000.0, 1.0);  // 0→1 every 2s
+          int eyebrow_y = (eyebrow_phase < 0.5) ? 1 : 6;      // step function (can replace with sine)
+
+          //-----------------------------------
+          // Blink logic
+          //-----------------------------------
+          bool blinking = false;
+          if (now >= next_blink_at) {
+            if (blink_progress < 180) { 
+              // blink duration ~180ms
+              blinking = true;
+              blink_progress += dt;
+            } else {
+              // done blinking
+              blinking = false;
+              blink_progress = 0;
+              next_blink_at = now + random(5000, 9000);
+            }
+          }
+
+          //-----------------------------------
+          // Draw eyebrows
+          //-----------------------------------
+          it.filled_triangle(8, eyebrow_y + 6, 23, eyebrow_y, 37, eyebrow_y + 4, COLOR_ON);
+          it.filled_triangle(37, eyebrow_y + 6, 23, eyebrow_y, 32, eyebrow_y + 8, COLOR_ON);
+          it.filled_triangle(90, 6 + 6, 105, eyebrow_y, 120, eyebrow_y + 8, COLOR_ON);
+          it.filled_triangle(90, 6 + 6, 95, eyebrow_y + 6, 94, eyebrow_y + 9, COLOR_ON);
+
+          //-----------------------------------
+          // Eyes
+          //-----------------------------------
+          if (!blinking) {
+            int eyeX = 23;
+            int eyeY = 43;
+            int eyeW = 46;
+
+            // whites
+            it.filled_rectangle(eyeX - 23, eyeY, eyeW, 20, COLOR_ON);
+            it.filled_circle(eyeX, eyeY, eyeW / 2, COLOR_ON);
+            it.filled_rectangle(128 - eyeX - 23, eyeY, eyeW, 20, COLOR_ON);
+            it.filled_circle(128 - eyeX, eyeY, eyeW / 2, COLOR_ON);
+
+            // Pupils (wander every 500ms)
+            int offsets[5] = {-4, -2, 4, 0, 2};
+            int pupil_offset = offsets[(elapsed / 2500) % 5];  
+
+            int py = 38;
+            it.filled_circle(eyeX + pupil_offset, py + eyebrow_y, 12, COLOR_OFF);
+            it.filled_circle(pupil_offset + 105, py + eyebrow_y, 12, COLOR_OFF);
+
+            it.filled_circle(eyeX + pupil_offset + 6, py - 4 + eyebrow_y, 4, COLOR_ON);
+            it.filled_circle(pupil_offset + 105 + 6, py - 4 + eyebrow_y, 4, COLOR_ON);
+
+            // Cheeks
+            it.filled_circle(eyeX, 130, 150 / 2, COLOR_OFF);
+            it.filled_circle(105, 130, 150 / 2, COLOR_OFF);
+
+            // eyelid shading
+            it.filled_rectangle(0, py - 23, 128, 2 + eyebrow_y, COLOR_OFF);
+
+          } else {
+            // Eyes closed
+            it.filled_rectangle(5, 38, 45, 4, COLOR_ON);
+            it.filled_rectangle(75, 38, 45, 4, COLOR_ON);
+          }
+
+
+      - id: candy_page
+        lambda: |-
+          static int frame = 0;
+          int eyeL = it.get_width()/4;
+          int eyeR = it.get_width()*3/4;
+          int eyeY = 44;
+
+          frame = (frame +1 ) % 700;
+          int shift = static_cast<int>(5*sin(3.14/4 * frame));
+          eyeL += shift;
+          eyeR += shift;
+          it.filled_ring(eyeL, eyeY, 19, 22, COLOR_ON);
+          it.filled_ring(eyeR, eyeY, 19, 22, COLOR_ON);
+          it.filled_rectangle(eyeL - 28, eyeY - 8, 54, 30, COLOR_OFF);
+          it.filled_rectangle(eyeR - 28, eyeY - 8, 54, 30, COLOR_OFF);
+
+          it.line_at_angle(eyeL, eyeY    , 210 , 24, 30, COLOR_ON);
+          it.line_at_angle(eyeL, eyeY -11, 160 , 24, 30, COLOR_ON);
+          it.line_at_angle(eyeR, eyeY    , -30 , 24, 30, COLOR_ON);
+          it.line_at_angle(eyeR, eyeY -11, 20  , 24, 30, COLOR_ON);
+      
+      - id: look_down
+        lambda: |-
+          // Draw eyebrows
+          // Example: draw a simple curved eyebrow using triangles
+          // Left eyebrow (yellow zone)
+          int eyebrow_y = 1;
+
+          it.filled_triangle(8, eyebrow_y + 6, 23, eyebrow_y, 37, eyebrow_y + 4, COLOR_ON);
+          it.filled_triangle(37, eyebrow_y + 6, 23, eyebrow_y, 32, eyebrow_y + 8, COLOR_ON);
+
+          // Right eyebrow (yellow zone)
+          it.filled_triangle(90, 6 + 6, 105, eyebrow_y, 120, eyebrow_y + 8, COLOR_ON);
+          it.filled_triangle(90, 6 + 6, 95, eyebrow_y +6 , 94, eyebrow_y + 9, COLOR_ON);
+
+          it.filled_circle(22, 44, 22 , COLOR_ON); // Left eye white
+          it.filled_circle(105, 46, 22 , COLOR_ON); // Right eye white
+
+          // Pupils 
+          it.filled_circle(22 , 62, 12, COLOR_OFF);
+          it.filled_circle(106, 62, 12, COLOR_OFF);
+
+font:
+  - file: "gfonts://Roboto"
+    id: roboto
+    size: 14
+
+script:
+  - id: dispense_candy
+    mode: restart
+    then:
+      - if:
+          condition:
+            - rtttl.is_playing
+          then:
+            - rtttl.stop
+      - if:
+          condition: 
+            lambda: 'return id(locked);'
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(from_global) == "override";'
+                then:
+                  lambda: 'id(locked) = false;'
+                else:
+                  - script.execute:
+                      id: send_message
+                      message: !lambda |-
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%.0f more minutes!", id(candy_minutes_left).state);
+                        return std::string(buf);
+                      sender: "Lock Message"
+          else: 
+            - display.page.show: candy_page
+            - rtttl.play: 'Black Bear:d=4,o=5,b=180:d#,d#,8g,16d#,8a#,16g,d#,d#,8g,16d#,8a#,16g,f,8c,16b4,c,8f,16d#,8d,16d#,8c,16d,8a#4,16c,8d,16a#4,d#,d#,8g,16d#,8a#,16g,d#,d#,8g,16d#,8a#,16g,f,f,f,8g,16f,d#,g,2d#'
+            - script.execute:
+                id: blink_leds
+                num_blinks: 20
+            - wait_until: 
+                condition:
+                  not:
+                    rtttl.is_playing
+            - display.page.show: look_down
+            - script.execute:
+                id: slow_servo
+                target_position: 40
+
+            - display.page.show: eyes_page
+            - delay: 1s
+            - display.page.show: look_down
+
+            - script.execute:
+                id: slow_servo
+                target_position: -75
+          
+            - globals.set:
+                id: dispense_count
+                value: !lambda 'return id(dispense_count) + 1;'
+      
+            - display.page.show: status_page
+            - delay: 3s
+            - display.page.show: eyes_page
+            - script.execute: start_lock_timer
+  
+  - id: blink_leds
+    mode: single
+    parameters: 
+      num_blinks: int
+    then:
+      - repeat:
+          count: !lambda 'return num_blinks;'
+          then:
+            - output.turn_on: led_red
+            - output.turn_off: led_green
+            - delay: 250ms
+            - output.turn_on: led_green
+            - output.turn_off: led_red
+            - delay: 250ms
+      - output.turn_off: led_green
+      - output.turn_off: led_red
+
+  - id: slow_servo
+    mode: restart
+    parameters:
+      target_position: int
+    then:
+      - while:
+          condition: 
+            not:
+              lambda: 'return id(servo_pos) == target_position;'
+          then:
+            - lambda: |-
+                int step = (target_position > id(servo_pos)) ? 1 : -1;
+                id(servo_pos) += step;
+                if ( id(servo_pos) > target_position || id(servo_pos) < target_position) {
+                  id(servo_pos) = target_position;
+                }
+                id(servo1).write(id(servo_pos) / 100.0);
+            - delay: 50ms
+            - script.execute:
+                id: slow_servo
+                target_position: !lambda 'return target_position;'
+
+  - id: send_message
+    mode: single
+    parameters:
+      message: string
+      sender: string
+    then:
+      - rtttl.play: "MsgPing:d=32,o=6,b=255:  c,c7 e,e7 g, g7 8c7 c, p, g,e c c7"
+      - lambda: |-        
+          id(display_message) = message;  //Update the global message
+          id(from_global) = sender;
+      - display.page.show: status_page
+      - script.execute:
+          id: blink_leds
+          num_blinks: 10
+      - wait_until:
+          condition:
+            not:  
+              - script.is_running: blink_leds
+      - display.page.show: eyes_page 
+
+  - id: start_lock_timer
+    then:
+      - lambda: |-
+          id(locked) = true;
+          // Use UL suffix to force unsigned long math
+          id(unlock_time) = millis() + 15UL * 60UL * 1000UL;  // 15 minutes from now
+
